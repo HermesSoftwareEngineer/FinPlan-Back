@@ -28,6 +28,16 @@ class Categoria extends Model {
           type: DataTypes.STRING,
           allowNull: true,
         },
+        grupo_id: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
+          references: {
+            model: 'grupos_categorias',
+            key: 'id',
+          },
+          onUpdate: 'CASCADE',
+          onDelete: 'SET NULL',
+        },
         user_id: {
           type: DataTypes.INTEGER,
           allowNull: false,
@@ -49,6 +59,7 @@ class Categoria extends Model {
 
   static associate(models) {
     this.belongsTo(models.User, { foreignKey: 'user_id', as: 'usuario' });
+    this.belongsTo(models.GrupoCategoria, { foreignKey: 'grupo_id', as: 'grupo' });
     this.hasMany(models.Movimento, { foreignKey: 'categoria_id', as: 'movimentos' });
   }
 }

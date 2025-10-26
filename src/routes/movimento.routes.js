@@ -3,6 +3,7 @@ const MovimentoController = require('../controllers/MovimentoController');
 
 const router = express.Router();
 
+router.get('/com-saldo', MovimentoController.indexComSaldo);
 router.get('/', MovimentoController.index);
 router.get('/:id', MovimentoController.show);
 router.post('/', MovimentoController.store);

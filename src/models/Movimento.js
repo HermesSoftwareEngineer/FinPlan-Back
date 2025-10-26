@@ -24,9 +24,13 @@ class Movimento extends Model {
           type: DataTypes.ENUM('receita', 'despesa', 'transferencia'),
           allowNull: false,
         },
-        data: {
+        data_competencia: {
           type: DataTypes.DATEONLY,
           allowNull: false,
+        },
+        data_pagamento: {
+          type: DataTypes.DATEONLY,
+          allowNull: true,
         },
         observacao: {
           type: DataTypes.TEXT,
@@ -36,6 +40,11 @@ class Movimento extends Model {
           type: DataTypes.BOOLEAN,
           allowNull: false,
           defaultValue: false,
+        },
+        origem: {
+          type: DataTypes.ENUM('manual', 'cartao', 'fatura'),
+          allowNull: false,
+          defaultValue: 'manual',
         },
         recorrente: {
           type: DataTypes.BOOLEAN,
@@ -62,8 +71,6 @@ class Movimento extends Model {
             model: 'users',
             key: 'id',
           },
-          onUpdate: 'CASCADE',
-          onDelete: 'CASCADE',
         },
         conta_id: {
           type: DataTypes.INTEGER,
@@ -72,8 +79,6 @@ class Movimento extends Model {
             model: 'contas',
             key: 'id',
           },
-          onUpdate: 'CASCADE',
-          onDelete: 'SET NULL',
         },
         categoria_id: {
           type: DataTypes.INTEGER,
@@ -82,8 +87,6 @@ class Movimento extends Model {
             model: 'categorias',
             key: 'id',
           },
-          onUpdate: 'CASCADE',
-          onDelete: 'SET NULL',
         },
         fatura_id: {
           type: DataTypes.INTEGER,
@@ -92,23 +95,46 @@ class Movimento extends Model {
             model: 'faturas',
             key: 'id',
           },
-          onUpdate: 'CASCADE',
-          onDelete: 'SET NULL',
+        },
+        sequencia_id: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
+          references: {
+            model: 'sequencias',
+            key: 'id',
+          },
+        },
+        sequencia_numero: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
         },
       },
       {
         sequelize,
         tableName: 'movimentos',
+        hooks: {
+          beforeSave: async (movimento) => {
+            // Se marcar como pago e não tiver data de pagamento, usar a data atual
+            if (movimento.changed('pago') && movimento.pago && !movimento.data_pagamento) {
+              movimento.data_pagamento = new Date();
+            }
+            // Se desmarcar como pago, limpar a data de pagamento
+            if (movimento.changed('pago') && !movimento.pago) {
+              movimento.data_pagamento = null;
+            }
+          },
+        },
       }
     );
     return this;
   }
 
   static associate(models) {
-    this.belongsTo(models.User, { foreignKey: 'user_id', as: 'usuario' });
-    this.belongsTo(models.Conta, { foreignKey: 'conta_id', as: 'conta' });
-    this.belongsTo(models.Categoria, { foreignKey: 'categoria_id', as: 'categoria' });
-    this.belongsTo(models.Fatura, { foreignKey: 'fatura_id', as: 'fatura' });
+  this.belongsTo(models.User, { foreignKey: 'user_id', as: 'usuario' });
+  this.belongsTo(models.Conta, { foreignKey: 'conta_id', as: 'conta' });
+  this.belongsTo(models.Categoria, { foreignKey: 'categoria_id', as: 'categoria' });
+  this.belongsTo(models.Fatura, { foreignKey: 'fatura_id', as: 'fatura' });
+  this.belongsTo(models.Sequencia, { foreignKey: 'sequencia_id', as: 'sequencia' });
   }
 }
 

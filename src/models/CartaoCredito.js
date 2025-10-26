@@ -20,6 +20,14 @@ class CartaoCredito extends Model {
             min: 0,
           },
         },
+        limite_utilizado: {
+          type: DataTypes.DECIMAL(10, 2),
+          allowNull: false,
+          defaultValue: 0,
+          validate: {
+            min: 0,
+          },
+        },
         dia_fechamento: {
           type: DataTypes.INTEGER,
           allowNull: false,
@@ -69,6 +77,16 @@ class CartaoCredito extends Model {
           onUpdate: 'CASCADE',
           onDelete: 'CASCADE',
         },
+        conta_id: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
+          references: {
+            model: 'contas',
+            key: 'id',
+          },
+          onUpdate: 'CASCADE',
+          onDelete: 'SET NULL',
+        },
       },
       {
         sequelize,
@@ -80,6 +98,7 @@ class CartaoCredito extends Model {
 
   static associate(models) {
     this.belongsTo(models.User, { foreignKey: 'user_id', as: 'usuario' });
+    this.belongsTo(models.Conta, { foreignKey: 'conta_id', as: 'conta' });
     this.hasMany(models.Fatura, { foreignKey: 'cartao_id', as: 'faturas' });
   }
 }

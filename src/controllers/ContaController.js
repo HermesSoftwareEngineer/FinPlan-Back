@@ -1,5 +1,5 @@
 const { models } = require('../models');
-const { Conta } = models;
+const { Conta, Movimento } = models;
 
 class ContaController {
   // Listar todas as contas do usuário
@@ -123,6 +123,121 @@ class ContaController {
     } catch (error) {
       console.error('Erro ao deletar conta:', error);
       return res.status(500).json({ error: 'Erro ao deletar conta' });
+    }
+  }
+
+  // Ajustar saldo inicial da conta
+  async ajustarSaldoInicial(req, res) {
+    try {
+      const { id } = req.params;
+      const { novo_saldo_inicial } = req.body;
+
+      if (novo_saldo_inicial === undefined || novo_saldo_inicial === null) {
+        return res.status(400).json({ error: 'O campo novo_saldo_inicial é obrigatório' });
+      }
+
+      const conta = await Conta.findOne({
+        where: { id, user_id: req.userId },
+      });
+
+      if (!conta) {
+        return res.status(404).json({ error: 'Conta não encontrada' });
+      }
+
+      // Calcular a diferença entre os saldos
+      const diferenca = parseFloat(novo_saldo_inicial) - parseFloat(conta.saldo_inicial);
+
+      // Atualizar os saldos
+      conta.saldo_inicial = novo_saldo_inicial;
+      conta.saldo_atual = parseFloat(conta.saldo_atual) + diferenca;
+      await conta.save();
+
+      return res.json({
+        message: 'Saldo inicial ajustado com sucesso',
+        conta,
+        ajuste: {
+          saldo_inicial_anterior: parseFloat(conta.saldo_inicial) - diferenca,
+          novo_saldo_inicial: parseFloat(conta.saldo_inicial),
+          diferenca: diferenca,
+        },
+      });
+    } catch (error) {
+      console.error('Erro ao ajustar saldo inicial:', error);
+      return res.status(500).json({ error: 'Erro ao ajustar saldo inicial' });
+    }
+  }
+
+  // Lançar movimento de ajuste de saldo
+  async lancarAjusteSaldo(req, res) {
+    try {
+      const { id } = req.params;
+      const { valor_ajuste, descricao, data_competencia } = req.body;
+
+      if (valor_ajuste === undefined || valor_ajuste === null) {
+        return res.status(400).json({ error: 'O campo valor_ajuste é obrigatório' });
+      }
+
+      const conta = await Conta.findOne({
+        where: { id, user_id: req.userId },
+      });
+
+      if (!conta) {
+        return res.status(404).json({ error: 'Conta não encontrada' });
+      }
+
+      // Determinar o tipo do movimento baseado no valor
+      const valorAjuste = parseFloat(valor_ajuste);
+      const tipo = valorAjuste >= 0 ? 'receita' : 'despesa';
+      const valorAbsoluto = Math.abs(valorAjuste);
+
+      // Criar movimento de ajuste
+      const movimento = await Movimento.create({
+        descricao: descricao || `Ajuste de saldo - ${tipo === 'receita' ? 'Entrada' : 'Saída'}`,
+        valor: valorAbsoluto,
+        tipo: tipo,
+        data_competencia: data_competencia || new Date().toISOString().split('T')[0],
+        data_pagamento: new Date().toISOString().split('T')[0],
+        observacao: 'Movimento automático de ajuste de saldo',
+        pago: true,
+        recorrente: false,
+        parcelado: false,
+        conta_id: conta.id,
+        categoria_id: null,
+        fatura_id: null,
+        user_id: req.userId,
+      });
+
+      // Atualizar saldo da conta
+      conta.saldo_atual = parseFloat(conta.saldo_atual) + valorAjuste;
+      await conta.save();
+
+      // Recarregar movimento com associações
+      const movimentoCompleto = await Movimento.findByPk(movimento.id, {
+        include: ['conta', 'categoria', 'fatura'],
+      });
+
+      return res.status(201).json({
+        message: 'Ajuste de saldo lançado com sucesso',
+        movimento: movimentoCompleto,
+        conta: {
+          id: conta.id,
+          nome: conta.nome,
+          saldo_anterior: parseFloat(conta.saldo_atual) - valorAjuste,
+          saldo_atual: parseFloat(conta.saldo_atual),
+          ajuste: valorAjuste,
+        },
+      });
+    } catch (error) {
+      console.error('Erro ao lançar ajuste de saldo:', error);
+      
+      if (error.name === 'SequelizeValidationError') {
+        return res.status(400).json({
+          error: 'Dados inválidos',
+          details: error.errors.map(e => e.message),
+        });
+      }
+
+      return res.status(500).json({ error: 'Erro ao lançar ajuste de saldo' });
     }
   }
 }

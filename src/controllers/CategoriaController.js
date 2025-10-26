@@ -5,15 +5,24 @@ class CategoriaController {
   // Listar todas as categorias do usuário
   async index(req, res) {
     try {
-      const { tipo } = req.query;
+      const { tipo, grupo_id } = req.query;
 
       const where = { user_id: req.userId };
       if (tipo) {
         where.tipo = tipo;
       }
+      if (grupo_id) {
+        where.grupo_id = grupo_id;
+      }
 
       const categorias = await Categoria.findAll({
         where,
+        include: [
+          {
+            association: 'grupo',
+            attributes: ['id', 'nome', 'cor', 'icone'],
+          },
+        ],
         order: [['nome', 'ASC']],
       });
 
@@ -31,6 +40,12 @@ class CategoriaController {
 
       const categoria = await Categoria.findOne({
         where: { id, user_id: req.userId },
+        include: [
+          {
+            association: 'grupo',
+            attributes: ['id', 'nome', 'cor', 'icone'],
+          },
+        ],
       });
 
       if (!categoria) {
@@ -47,17 +62,28 @@ class CategoriaController {
   // Criar nova categoria
   async store(req, res) {
     try {
-      const { nome, tipo, cor, icone } = req.body;
+      const { nome, tipo, cor, icone, grupo_id } = req.body;
 
       const categoria = await Categoria.create({
         nome,
         tipo,
         cor,
         icone,
+        grupo_id,
         user_id: req.userId,
       });
 
-      return res.status(201).json(categoria);
+      // Recarregar com associações
+      const categoriaCompleta = await Categoria.findByPk(categoria.id, {
+        include: [
+          {
+            association: 'grupo',
+            attributes: ['id', 'nome', 'cor', 'icone'],
+          },
+        ],
+      });
+
+      return res.status(201).json(categoriaCompleta);
     } catch (error) {
       console.error('Erro ao criar categoria:', error);
       
@@ -76,7 +102,7 @@ class CategoriaController {
   async update(req, res) {
     try {
       const { id } = req.params;
-      const { nome, tipo, cor, icone } = req.body;
+      const { nome, tipo, cor, icone, grupo_id } = req.body;
 
       const categoria = await Categoria.findOne({
         where: { id, user_id: req.userId },
@@ -91,9 +117,20 @@ class CategoriaController {
         tipo,
         cor,
         icone,
+        grupo_id,
       });
 
-      return res.json(categoria);
+      // Recarregar com associações
+      const categoriaAtualizada = await Categoria.findByPk(id, {
+        include: [
+          {
+            association: 'grupo',
+            attributes: ['id', 'nome', 'cor', 'icone'],
+          },
+        ],
+      });
+
+      return res.json(categoriaAtualizada);
     } catch (error) {
       console.error('Erro ao atualizar categoria:', error);
       

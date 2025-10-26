@@ -52,6 +52,26 @@ class Fatura extends Model {
           onUpdate: 'CASCADE',
           onDelete: 'CASCADE',
         },
+        movimento_pagamento_id: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
+          references: {
+            model: 'movimentos',
+            key: 'id',
+          },
+          onUpdate: 'CASCADE',
+          onDelete: 'SET NULL',
+        },
+        conta_id: {
+          type: DataTypes.INTEGER,
+          allowNull: true,
+          references: {
+            model: 'contas',
+            key: 'id',
+          },
+          onUpdate: 'CASCADE',
+          onDelete: 'SET NULL',
+        },
       },
       {
         sequelize,
@@ -63,7 +83,9 @@ class Fatura extends Model {
 
   static associate(models) {
     this.belongsTo(models.CartaoCredito, { foreignKey: 'cartao_id', as: 'cartao' });
+    this.belongsTo(models.Conta, { foreignKey: 'conta_id', as: 'conta' });
     this.hasMany(models.Movimento, { foreignKey: 'fatura_id', as: 'movimentos' });
+    this.belongsTo(models.Movimento, { foreignKey: 'movimento_pagamento_id', as: 'movimento_pagamento' });
   }
 }
 

@@ -7,6 +7,6 @@ router.get('/', CartaoCreditoController.index);
 router.get('/:id', CartaoCreditoController.show);
 router.post('/', CartaoCreditoController.store);
 router.put('/:id', CartaoCreditoController.update);
-router.delete('/:id', CartaoCreditoController.delete);
+router.delete('/:id', CartaoCreditoController.destroy);
 
 module.exports = router;

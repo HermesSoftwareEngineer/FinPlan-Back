@@ -3,15 +3,38 @@ const dbConfig = require('../config/database');
 
 // Importar models
 const User = require('./User');
+const Conta = require('./Conta');
+const Categoria = require('./Categoria');
+const CartaoCredito = require('./CartaoCredito');
+const Fatura = require('./Fatura');
+const Movimento = require('./Movimento');
 
 // Criar conexão
 const sequelize = new Sequelize(dbConfig);
 
 // Inicializar models
 User.init(sequelize);
+Conta.init(sequelize);
+Categoria.init(sequelize);
+CartaoCredito.init(sequelize);
+Fatura.init(sequelize);
+Movimento.init(sequelize);
 
-// Associações (quando houver relacionamentos entre models)
-// User.associate(sequelize.models);
+// Associações entre models
+const models = {
+  User,
+  Conta,
+  Categoria,
+  CartaoCredito,
+  Fatura,
+  Movimento,
+};
+
+Object.keys(models).forEach((modelName) => {
+  if (models[modelName].associate) {
+    models[modelName].associate(models);
+  }
+});
 
 // Sincronizar com o banco de dados
 const syncDatabase = async () => {
@@ -26,7 +49,5 @@ const syncDatabase = async () => {
 module.exports = {
   sequelize,
   syncDatabase,
-  models: {
-    User,
-  },
+  models,
 };

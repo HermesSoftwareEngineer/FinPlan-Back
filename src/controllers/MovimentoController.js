@@ -1,5 +1,5 @@
 const { models } = require('../models');
-const { Movimento, Conta, Fatura, CartaoCredito } = models;
+const { Movimento, Conta, Fatura, CartaoCredito, Sequencia } = models;
 const { Op } = require('sequelize');
 
 class MovimentoController {
@@ -473,8 +473,22 @@ class MovimentoController {
         numeroRepeticoes = parseInt(total_parcelas);
         tipoLancamento = 'parcelado';
       } else if (recorrente) {
-        numeroRepeticoes = meses_recorrencia ? parseInt(meses_recorrencia) : 12; // Padrão: 12 meses
+        numeroRepeticoes = meses_recorrencia ? parseInt(meses_recorrencia) : 48; // Padrão: 48 meses
         tipoLancamento = 'recorrente';
+      }
+
+      let sequencia_id;
+      if (tipoLancamento == 'recorrente'){
+        const sequencia = await Sequencia.create({
+          descricao: descricao,
+          valor: valor,
+          tipo: tipo,
+          data_inicio: data_competencia,
+          ativo: true,
+        });
+        console.log("sequencia: ", sequencia)
+        sequencia_id = sequencia.dataValues.id;
+        console.log("sequencia_id: ", sequencia_id)
       }
 
       // Criar as repetições (parcelas ou recorrências)
@@ -605,8 +619,7 @@ class MovimentoController {
           descricaoFinal = `${descricao} (${mesAno})`;
         }
 
-        // Criar o movimento
-        const movimento = await Movimento.create({
+        let dadosMovimento = {
           descricao: descricaoFinal,
           valor,
           tipo,
@@ -623,7 +636,15 @@ class MovimentoController {
           categoria_id,
           fatura_id: faturaIdParcela,
           user_id: req.userId,
-        });
+        };
+
+        if (tipoLancamento === 'recorrente' && sequencia_id) {
+          dadosMovimento.sequencia_id = sequencia_id;
+          dadosMovimento.sequencia_numero = i + 1;
+        }
+
+        // Criar o movimento
+        const movimento = await Movimento.create(dadosMovimento);
 
         // Recarregar com associações
         const movimentoCompleto = await Movimento.findByPk(movimento.id, {
@@ -682,7 +703,7 @@ class MovimentoController {
         categoria_id,
         fatura_id,
         cartao_id,
-        impactar = 'atual', // 'atual', 'todos', 'futuros', 'anteriores'
+        impactar = 'atual', // 'atual', 'todos', 'futuros'
       } = req.body;
 
       const movimento = await Movimento.findOne({
@@ -741,7 +762,7 @@ class MovimentoController {
               where: {
                 sequencia_id: movimento.sequencia_id,
                 user_id: req.userId,
-                sequencia_numero: { [Op.gte]: movimento.sequencia_numero },
+                sequencia_numero: { [Op.gte]: movimento.sequencia_numero }, // Inclui o atual e os futuros
               },
             });
             break;

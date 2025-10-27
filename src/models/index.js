@@ -12,7 +12,12 @@ const Movimento = require('./Movimento');
 const Sequencia = require('./Sequencia');
 
 // Criar conexão
-const sequelize = new Sequelize(dbConfig);
+const sequelize = new Sequelize(dbConfig.url, {
+  dialect: 'postgres',
+  logging: dbConfig.logging,
+  dialectOptions: dbConfig.dialectOptions,
+  define: dbConfig.define,
+});
 
 // Inicializar models
 User.init(sequelize);

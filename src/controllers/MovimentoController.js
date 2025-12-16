@@ -3,121 +3,159 @@ const { Movimento, Conta, Fatura, CartaoCredito, Sequencia } = models;
 const { Op } = require('sequelize');
 
 class MovimentoController {
-  // Função auxiliar para gerenciar fatura do cartão
-  async gerenciarFaturaCartao(cartao_id, data_competencia, valor, user_id) {
-    // Obter o cartão
-    const cartao = await CartaoCredito.findOne({
-      where: { id: cartao_id, user_id },
+
+  // FUNÇÕES AUXILIARES DE RECÁLCULO DE SALDO
+
+  async _recalcularSaldoConta(conta_id, user_id) {
+    if (!conta_id) return;
+
+    const conta = await Conta.findOne({ where: { id: conta_id, user_id } });
+    if (!conta) return;
+
+    // Busca todos os movimentos pagos da conta que não são de cartão de crédito
+    const movimentosPagos = await Movimento.findAll({
+      where: {
+        conta_id,
+        user_id,
+        pago: true,
+        origem: { [Op.notIn]: ['cartao'] } // Não contar compras de cartão no saldo da conta
+      }
     });
 
-    if (!cartao) {
-      throw new Error('Cartão de crédito não encontrado');
+    let saldoCalculado = parseFloat(conta.saldo_inicial);
+
+    movimentosPagos.forEach(mov => {
+      const valor = parseFloat(mov.valor);
+      if (mov.tipo === 'receita') {
+        saldoCalculado += valor;
+      } else {
+        saldoCalculado -= valor;
+      }
+    });
+
+    conta.saldo_atual = saldoCalculado;
+    await conta.save();
+  }
+
+  async _recalcularValoresFatura(fatura_id, user_id) {
+    if (!fatura_id) return;
+
+    const fatura = await Fatura.findOne({ where: { id: fatura_id }, include: [{ model: CartaoCredito, as: 'cartao' }] });
+    if (!fatura || fatura.cartao.user_id !== user_id) return;
+
+    const movimentosDaFatura = await Movimento.findAll({
+      where: {
+        fatura_id,
+        user_id,
+        origem: 'cartao'
+      }
+    });
+
+    const valorTotalCalculado = movimentosDaFatura.reduce((acc, mov) => acc + parseFloat(mov.valor), 0);
+
+    fatura.valor_total = valorTotalCalculado;
+    await fatura.save();
+
+    if (fatura.movimento_pagamento_id) {
+      const movimentoPagamento = await Movimento.findByPk(fatura.movimento_pagamento_id);
+      if (movimentoPagamento) {
+        movimentoPagamento.valor = valorTotalCalculado;
+        await movimentoPagamento.save();
+      }
     }
 
-    // Calcular mês e ano de referência baseado na data de competência e dia de fechamento
-    const dataMovimento = new Date(data_competencia);
-    const diaMovimento = dataMovimento.getDate();
-    const mesMovimento = dataMovimento.getMonth(); // 0-11
-    const anoMovimento = dataMovimento.getFullYear();
+    return fatura.cartao_id;
+  }
+
+  async _recalcularLimiteCartao(cartao_id, user_id) {
+    if (!cartao_id) return;
+
+    const cartao = await CartaoCredito.findOne({ where: { id: cartao_id, user_id } });
+    if (!cartao) return;
+
+    const faturas = await Fatura.findAll({ where: { cartao_id } });
+    if (faturas.length === 0) {
+      cartao.limite_utilizado = 0;
+      await cartao.save();
+      return;
+    }
+
+    const faturasIds = faturas.map(f => f.id);
+
+    const movimentosDoCartao = await Movimento.findAll({
+      where: {
+        fatura_id: { [Op.in]: faturasIds },
+        user_id,
+        origem: 'cartao'
+      }
+    });
+
+    const limiteUtilizadoCalculado = movimentosDoCartao.reduce((acc, mov) => acc + parseFloat(mov.valor), 0);
+
+    cartao.limite_utilizado = limiteUtilizadoCalculado;
+    await cartao.save();
+  }
+
+  // Função auxiliar para gerenciar fatura do cartão (APENAS ENCONTRA OU CRIA)
+  async _encontrarOuCriarFatura(cartao_id, data_competencia, user_id) {
+    const cartao = await CartaoCredito.findOne({ where: { id: cartao_id, user_id } });
+    if (!cartao) throw new Error('Cartão de crédito não encontrado');
+
+    const dataMovimento = new Date(data_competencia + 'T00:00:00Z');
+    const diaMovimento = dataMovimento.getUTCDate();
+    const mesMovimento = dataMovimento.getUTCMonth();
+    const anoMovimento = dataMovimento.getUTCFullYear();
 
     let mes_referencia, ano_referencia;
 
-    // Se a compra foi feita após o fechamento, vai para a próxima fatura
     if (diaMovimento > cartao.dia_fechamento) {
-      mes_referencia = mesMovimento + 2; // +1 para próximo mês, +1 porque getMonth é 0-based
+      mes_referencia = mesMovimento + 2;
       ano_referencia = anoMovimento;
-      
       if (mes_referencia > 12) {
-        mes_referencia = mes_referencia - 12;
-        ano_referencia = ano_referencia + 1;
+        mes_referencia = 1;
+        ano_referencia += 1;
       }
     } else {
-      mes_referencia = mesMovimento + 1; // +1 porque getMonth é 0-based
+      mes_referencia = mesMovimento + 1;
       ano_referencia = anoMovimento;
     }
 
-    // Buscar fatura (que já deve existir, criada ao cadastrar cartão)
-    let fatura = await Fatura.findOne({
-      where: {
-        cartao_id,
-        mes_referencia,
-        ano_referencia,
-      },
-    });
+    let fatura = await Fatura.findOne({ where: { cartao_id, mes_referencia, ano_referencia } });
 
     if (!fatura) {
-      // Se não encontrou a fatura, criar (fallback para cartões antigos)
-      const dataFechamento = new Date(ano_referencia, mes_referencia - 1, cartao.dia_fechamento);
-      const dataVencimento = new Date(ano_referencia, mes_referencia - 1, cartao.dia_vencimento);
+      const dataFechamento = new Date(Date.UTC(ano_referencia, mes_referencia - 1, cartao.dia_fechamento));
+      const dataVencimento = new Date(Date.UTC(ano_referencia, mes_referencia - 1, cartao.dia_vencimento));
 
       fatura = await Fatura.create({
         mes_referencia,
         ano_referencia,
         data_fechamento: dataFechamento.toISOString().split('T')[0],
         data_vencimento: dataVencimento.toISOString().split('T')[0],
-        valor_total: valor,
+        valor_total: 0, // Inicia com 0
         valor_pago: 0,
         status: 'aberta',
         cartao_id,
-        conta_id: cartao.conta_id, // Usar conta padrão do cartão
+        conta_id: cartao.conta_id,
       });
 
-      // Criar movimento de pagamento da fatura
       const movimentoPagamento = await Movimento.create({
         descricao: `Pagamento Fatura ${cartao.nome} - ${mes_referencia.toString().padStart(2, '0')}/${ano_referencia}`,
-        valor: valor,
+        valor: 0, // Inicia com 0
         tipo: 'despesa',
         data_competencia: fatura.data_vencimento,
-        data_pagamento: fatura.data_vencimento, // Mesma data do vencimento
+        data_pagamento: fatura.data_vencimento,
         pago: false,
         recorrente: false,
         origem: 'fatura',
-        conta_id: cartao.conta_id, // Usar conta padrão do cartão
+        conta_id: cartao.conta_id,
         categoria_id: null,
-        fatura_id: fatura.id, // Vincular à fatura
+        fatura_id: fatura.id,
         user_id: user_id,
       });
 
-      // Vincular movimento à fatura
       fatura.movimento_pagamento_id = movimentoPagamento.id;
       await fatura.save();
-    } else {
-      // Fatura já existe, apenas atualizar valor
-      fatura.valor_total = parseFloat(fatura.valor_total) + parseFloat(valor);
-      await fatura.save();
-
-      // Atualizar valor do movimento de pagamento, se existir
-      if (fatura.movimento_pagamento_id) {
-        const movimentoPagamento = await Movimento.findByPk(fatura.movimento_pagamento_id);
-        if (movimentoPagamento) {
-          movimentoPagamento.valor = fatura.valor_total;
-          await movimentoPagamento.save();
-        }
-      } else {
-        // Se a fatura existe mas não tem movimento de pagamento, criar
-        const movimentoPagamento = await Movimento.create({
-          descricao: `Pagamento Fatura ${cartao.nome} - ${mes_referencia.toString().padStart(2, '0')}/${ano_referencia}`,
-          valor: fatura.valor_total,
-          tipo: 'despesa',
-          data_competencia: fatura.data_vencimento,
-          data_pagamento: fatura.data_vencimento, // Mesma data do vencimento
-          pago: false,
-          recorrente: false,
-          origem: 'fatura',
-          conta_id: cartao.conta_id,
-          categoria_id: null,
-          fatura_id: fatura.id, // Vincular à fatura
-          user_id: user_id,
-        });
-
-        fatura.movimento_pagamento_id = movimentoPagamento.id;
-        await fatura.save();
-      }
     }
-
-    // Atualizar limite utilizado do cartão
-    cartao.limite_utilizado = parseFloat(cartao.limite_utilizado) + parseFloat(valor);
-    await cartao.save();
 
     return fatura.id;
   }
@@ -129,70 +167,40 @@ class MovimentoController {
 
       const where = { user_id: req.userId };
 
-      // Por padrão, NÃO incluir movimentos de origem cartão
       if (incluir_cartao !== 'true') {
-        where.origem = {
-          [Op.ne]: 'cartao'
-        };
+        where.origem = { [Op.ne]: 'cartao' };
       }
-
       if (tipo) {
         where.tipo = tipo;
       }
-
       if (pago !== undefined) {
         where.pago = pago === 'true';
       }
-
       if (data_inicio && data_fim) {
-        where.data_competencia = {
-          [Op.between]: [data_inicio, data_fim],
-        };
+        where.data_competencia = { [Op.between]: [data_inicio, data_fim] };
       } else if (data_inicio) {
-        where.data_competencia = {
-          [Op.gte]: data_inicio,
-        };
+        where.data_competencia = { [Op.gte]: data_inicio };
       } else if (data_fim) {
-        where.data_competencia = {
-          [Op.lte]: data_fim,
-        };
+        where.data_competencia = { [Op.lte]: data_fim };
       }
-
       if (conta_id) {
         where.conta_id = conta_id;
       }
-
-      // Filtro por múltiplas categorias
       if (categorias) {
-        // Aceita array de IDs: ?categorias=1,2,3 ou ?categorias[]=1&categorias[]=2
-        const categoriasArray = Array.isArray(categorias) 
-          ? categorias 
+        const categoriasArray = Array.isArray(categorias)
+          ? categorias
           : categorias.split(',').map(id => parseInt(id.trim()));
-        
-        where.categoria_id = {
-          [Op.in]: categoriasArray,
-        };
+        where.categoria_id = { [Op.in]: categoriasArray };
       } else if (categoria_id) {
-        // Filtro por categoria única (mantém compatibilidade)
         where.categoria_id = categoria_id;
       }
 
       const movimentos = await Movimento.findAll({
         where,
         include: [
-          {
-            association: 'conta',
-            attributes: ['id', 'nome', 'tipo'],
-          },
-          {
-            association: 'categoria',
-            attributes: ['id', 'nome', 'tipo', 'cor', 'icone'],
-          },
-          {
-            association: 'fatura',
-            attributes: ['id', 'mes_referencia', 'ano_referencia'],
-            include: ['cartao'],
-          },
+          { association: 'conta', attributes: ['id', 'nome', 'tipo'] },
+          { association: 'categoria', attributes: ['id', 'nome', 'tipo', 'cor', 'icone'] },
+          { association: 'fatura', attributes: ['id', 'mes_referencia', 'ano_referencia'], include: ['cartao'] },
         ],
         order: [['data_competencia', 'DESC'], ['created_at', 'DESC']],
       });
@@ -209,121 +217,99 @@ class MovimentoController {
     try {
       const { tipo, data_inicio, data_fim, conta_id, categoria_id, categorias, incluir_cartao } = req.query;
 
-      const where = { user_id: req.userId };
+      // 1. CRIAÇÃO DOS FILTROS BASE (SEM DATA)
+      const baseWhere = { user_id: req.userId };
 
-      // Por padrão, NÃO incluir movimentos de origem cartão
       if (incluir_cartao !== 'true') {
-        where.origem = {
-          [Op.ne]: 'cartao'
-        };
+        baseWhere.origem = { [Op.ne]: 'cartao' };
       }
-
       if (tipo) {
-        where.tipo = tipo;
+        baseWhere.tipo = tipo;
       }
-
-      if (data_inicio && data_fim) {
-        where.data_competencia = {
-          [Op.between]: [data_inicio, data_fim],
-        };
-      } else if (data_inicio) {
-        where.data_competencia = {
-          [Op.gte]: data_inicio,
-        };
-      } else if (data_fim) {
-        where.data_competencia = {
-          [Op.lte]: data_fim,
-        };
-      }
-
       if (conta_id) {
-        where.conta_id = conta_id;
+        baseWhere.conta_id = conta_id;
       }
-
-      // Filtro por múltiplas categorias
       if (categorias) {
-        const categoriasArray = Array.isArray(categorias) 
-          ? categorias 
+        const categoriasArray = Array.isArray(categorias)
+          ? categorias
           : categorias.split(',').map(id => parseInt(id.trim()));
-        
-        where.categoria_id = {
-          [Op.in]: categoriasArray,
-        };
+        baseWhere.categoria_id = { [Op.in]: categoriasArray };
       } else if (categoria_id) {
-        where.categoria_id = categoria_id;
+        baseWhere.categoria_id = categoria_id;
       }
 
-      // Buscar todos os movimentos ordenados por data
-      const movimentos = await Movimento.findAll({
-        where,
+      // 2. BUSCAR SALDO INICIAL DA CONTA E CALCULAR SALDOS GERAIS (REAL E PREVISTO)
+      let saldoBaseConta = 0;
+      if (conta_id) {
+        const conta = await Conta.findOne({ where: { id: conta_id, user_id: req.userId } });
+        if (conta) {
+          saldoBaseConta = parseFloat(conta.saldo_inicial);
+        }
+      }
+
+      const todosMovimentos = await Movimento.findAll({ where: baseWhere });
+
+      let saldoFinalRealGeral = saldoBaseConta;
+      let saldoFinalPrevistoGeral = saldoBaseConta;
+
+      todosMovimentos.forEach(mov => {
+        const valor = parseFloat(mov.valor);
+        const multiplicador = mov.tipo === 'receita' ? 1 : -1;
+        saldoFinalPrevistoGeral += valor * multiplicador;
+        if (mov.pago) {
+          saldoFinalRealGeral += valor * multiplicador;
+        }
+      });
+
+      // 3. CALCULAR SALDO INICIAL PARA O PERÍODO FILTRADO
+      let saldoInicialPeriodo = saldoBaseConta;
+      if (conta_id && data_inicio) {
+        const whereSaldoInicial = {
+          user_id: req.userId,
+          conta_id: conta_id,
+          pago: true,
+          origem: { [Op.ne]: 'cartao' },
+          data_competencia: { [Op.lt]: data_inicio },
+        };
+        const movimentosAnteriores = await Movimento.findAll({ where: whereSaldoInicial });
+
+        movimentosAnteriores.forEach(mov => {
+          const valor = parseFloat(mov.valor);
+          saldoInicialPeriodo += mov.tipo === 'receita' ? valor : -valor;
+        });
+      }
+
+      // 4. BUSCAR MOVIMENTOS DO PERÍODO E PROCESSAR PARA A RESPOSTA
+      const wherePeriodo = { ...baseWhere };
+      if (data_inicio && data_fim) {
+        wherePeriodo.data_competencia = { [Op.between]: [data_inicio, data_fim] };
+      } else if (data_inicio) {
+        wherePeriodo.data_competencia = { [Op.gte]: data_inicio };
+      } else if (data_fim) {
+        wherePeriodo.data_competencia = { [Op.lte]: data_fim };
+      }
+
+      const movimentosPeriodo = await Movimento.findAll({
+        where: wherePeriodo,
         include: [
-          {
-            association: 'conta',
-            attributes: ['id', 'nome', 'tipo', 'saldo_atual'],
-          },
-          {
-            association: 'categoria',
-            attributes: ['id', 'nome', 'tipo', 'cor', 'icone'],
-          },
-          {
-            association: 'fatura',
-            attributes: ['id', 'mes_referencia', 'ano_referencia'],
-            include: ['cartao'],
-          },
+          { association: 'conta', attributes: ['id', 'nome', 'tipo', 'saldo_atual'] },
+          { association: 'categoria', attributes: ['id', 'nome', 'tipo', 'cor', 'icone'] },
+          { association: 'fatura', attributes: ['id', 'mes_referencia', 'ano_referencia'], include: ['cartao'] },
         ],
         order: [['data_competencia', 'ASC'], ['created_at', 'ASC']],
       });
 
-      // Calcular saldo inicial (se há filtro de conta)
-      let saldoInicial = 0;
-      if (conta_id) {
-        const conta = await Conta.findOne({
-          where: { id: conta_id, user_id: req.userId },
-        });
-        
-        if (conta) {
-          saldoInicial = parseFloat(conta.saldo_inicial);
-          
-          // Se há filtro de data_inicio, calcular o saldo até essa data
-          if (data_inicio) {
-            const movimentosAnteriores = await Movimento.findAll({
-              where: {
-                user_id: req.userId,
-                conta_id: conta_id,
-                pago: true,
-                origem: {
-                  [Op.ne]: 'cartao'
-                },
-                data_competencia: {
-                  [Op.lt]: data_inicio,
-                },
-              },
-            });
-
-            movimentosAnteriores.forEach(mov => {
-              const valor = parseFloat(mov.valor);
-              if (mov.tipo === 'receita') {
-                saldoInicial += valor;
-              } else if (mov.tipo === 'despesa') {
-                saldoInicial -= valor;
-              }
-            });
-          }
-        }
-      }
-
-      // Agrupar movimentos por data_competencia e calcular saldos
+      // 5. AGRUPAR MOVIMENTOS POR DATA E CALCULAR TOTAIS DO PERÍODO
       const movimentosPorData = {};
-      let saldoRealAcumulado = saldoInicial;
-      let saldoPrevistoAcumulado = saldoInicial;
+      let saldoRealAcumulado = saldoInicialPeriodo;
+      let saldoPrevistoAcumulado = saldoInicialPeriodo;
       
-      // Variáveis para totais gerais
       let totalReceitasPagas = 0;
       let totalDespesasPagas = 0;
       let totalReceitasPrevistas = 0;
       let totalDespesasPrevistas = 0;
 
-      movimentos.forEach(movimento => {
+      movimentosPeriodo.forEach(movimento => {
         const data_competencia = movimento.data_competencia;
         const valor = parseFloat(movimento.valor);
         const multiplicador = movimento.tipo === 'receita' ? 1 : -1;
@@ -342,15 +328,13 @@ class MovimentoController {
           };
         }
 
-        // Adicionar movimento ao dia
         movimentosPorData[data_competencia].movimentos.push(movimento);
 
-        // Atualizar totais
         if (movimento.pago) {
           if (movimento.tipo === 'receita') {
             movimentosPorData[data_competencia].receitas_pagas += valor;
             totalReceitasPagas += valor;
-          } else if (movimento.tipo === 'despesa') {
+          } else {
             movimentosPorData[data_competencia].despesas_pagas += valor;
             totalDespesasPagas += valor;
           }
@@ -359,7 +343,7 @@ class MovimentoController {
           if (movimento.tipo === 'receita') {
             movimentosPorData[data_competencia].receitas_previstas += valor;
             totalReceitasPrevistas += valor;
-          } else if (movimento.tipo === 'despesa') {
+          } else {
             movimentosPorData[data_competencia].despesas_previstas += valor;
             totalDespesasPrevistas += valor;
           }
@@ -367,20 +351,17 @@ class MovimentoController {
 
         saldoPrevistoAcumulado += valor * multiplicador;
 
-        // Atualizar saldos do dia
         movimentosPorData[data_competencia].saldo_real = saldoRealAcumulado;
         movimentosPorData[data_competencia].saldo_previsto = saldoPrevistoAcumulado;
       });
 
-      // Converter objeto em array e ordenar por data decrescente
-      const resultado = Object.values(movimentosPorData).sort((a, b) => {
-        return new Date(b.data) - new Date(a.data);
-      });
+      const resultado = Object.values(movimentosPorData).sort((a, b) => new Date(b.data) - new Date(a.data));
 
+      // 6. MONTAR RESPOSTA FINAL
       return res.json({
-        saldo_inicial: saldoInicial,
-        saldo_final_real: saldoRealAcumulado,
-        saldo_final_previsto: saldoPrevistoAcumulado,
+        saldo_inicial: saldoInicialPeriodo,
+        saldo_final_real: saldoFinalRealGeral,
+        saldo_final_previsto: saldoFinalPrevistoGeral,
         totais: {
           receitas_pagas: totalReceitasPagas,
           despesas_pagas: totalDespesasPagas,
@@ -438,34 +419,20 @@ class MovimentoController {
         pago,
         recorrente,
         parcelado,
-        numero_parcela,
         total_parcelas,
-        meses_recorrencia, // Novo: quantos meses criar para lançamento recorrente (padrão: 12)
+        meses_recorrencia,
         conta_id,
         categoria_id,
         fatura_id,
-        cartao_id, // Novo campo para identificar se é lançamento de cartão
+        cartao_id,
       } = req.body;
 
-      let faturaIdFinal = fatura_id;
-      let dataPagamentoFinal = data_pagamento;
-      let origemFinal = 'manual'; // Padrão para movimentos criados pelo usuário
-
-      // Verificar se a conta pertence ao usuário (se fornecida)
       if (conta_id) {
-        const conta = await Conta.findOne({
-          where: { id: conta_id, user_id: req.userId },
-        });
-
-        if (!conta) {
-          return res.status(404).json({ error: 'Conta não encontrada' });
-        }
+        const conta = await Conta.findOne({ where: { id: conta_id, user_id: req.userId } });
+        if (!conta) return res.status(404).json({ error: 'Conta não encontrada' });
       }
 
-      // Array para armazenar todos os movimentos criados
       const movimentosCriados = [];
-
-      // Definir número de repetições baseado no tipo de lançamento
       let numeroRepeticoes = 1;
       let tipoLancamento = 'unico';
 
@@ -473,212 +440,94 @@ class MovimentoController {
         numeroRepeticoes = parseInt(total_parcelas);
         tipoLancamento = 'parcelado';
       } else if (recorrente) {
-        numeroRepeticoes = meses_recorrencia ? parseInt(meses_recorrencia) : 48; // Padrão: 48 meses
+        numeroRepeticoes = meses_recorrencia ? parseInt(meses_recorrencia) : 48;
         tipoLancamento = 'recorrente';
       }
 
       let sequencia_id;
-      if (tipoLancamento == 'recorrente'){
-        const sequencia = await Sequencia.create({
-          descricao: descricao,
-          valor: valor,
-          tipo: tipo,
-          data_inicio: data_competencia,
-          ativo: true,
-        });
-        console.log("sequencia: ", sequencia)
-        sequencia_id = sequencia.dataValues.id;
-        console.log("sequencia_id: ", sequencia_id)
+      if (tipoLancamento === 'recorrente') {
+        const sequencia = await Sequencia.create({ descricao, valor, tipo, data_inicio: data_competencia, ativo: true });
+        sequencia_id = sequencia.id;
       }
 
-      // Criar as repetições (parcelas ou recorrências)
       for (let i = 0; i < numeroRepeticoes; i++) {
-        // Calcular data de competência da parcela/recorrência
-        // Usar Date.UTC para evitar problemas com timezone
-        const dataOriginal = new Date(data_competencia + 'T00:00:00');
-        const dia = dataOriginal.getDate();
-        const mes = dataOriginal.getMonth();
-        const ano = dataOriginal.getFullYear();
-        
-        // Adicionar meses preservando o dia
-        const novoMes = mes + i;
-        const dataCompetenciaParcela = new Date(ano, novoMes, dia);
+        const dataOriginal = new Date(data_competencia + 'T00:00:00Z');
+        const dataCompetenciaParcela = new Date(dataOriginal.setUTCMonth(dataOriginal.getUTCMonth() + i));
         const dataCompetenciaParcelaStr = dataCompetenciaParcela.toISOString().split('T')[0];
 
-        // Calcular data de pagamento da parcela (se fornecida)
-        let dataPagamentoParcelaStr = null;
+        let dataPagamentoFinalParcela = data_pagamento;
         if (data_pagamento) {
-          const dataPagOriginal = new Date(data_pagamento + 'T00:00:00');
-          const diaPag = dataPagOriginal.getDate();
-          const mesPag = dataPagOriginal.getMonth();
-          const anoPag = dataPagOriginal.getFullYear();
-          
-          const novoMesPag = mesPag + i;
-          const dataPagamentoParcela = new Date(anoPag, novoMesPag, diaPag);
-          dataPagamentoParcelaStr = dataPagamentoParcela.toISOString().split('T')[0];
+          const dataPagOriginal = new Date(data_pagamento + 'T00:00:00Z');
+          const dataPagamentoParcela = new Date(dataPagOriginal.setUTCMonth(dataPagOriginal.getUTCMonth() + i));
+          dataPagamentoFinalParcela = dataPagamentoParcela.toISOString().split('T')[0];
         }
 
         let faturaIdParcela = fatura_id;
-        let dataPagamentoFinalParcela = dataPagamentoParcelaStr;
-        let origemParcela = origemFinal;
+        let origemParcela = 'manual';
 
-        // Se forneceu cartao_id, gerenciar fatura automaticamente para cada parcela
-        if (cartao_id && !fatura_id) {
-          faturaIdParcela = await this.gerenciarFaturaCartao(
-            cartao_id,
-            dataCompetenciaParcelaStr,
-            valor,
-            req.userId
-          );
-
-          origemParcela = 'cartao'; // Movimento originado de compra no cartão
-
-          // Buscar a fatura criada/atualizada para pegar a data de vencimento
-          if (!dataPagamentoParcelaStr && faturaIdParcela) {
-            const fatura = await Fatura.findByPk(faturaIdParcela);
-            if (fatura) {
-              dataPagamentoFinalParcela = fatura.data_vencimento;
-            }
-          }
-        } else if (fatura_id && i === 0) {
-          // Se forneceu fatura_id diretamente, atualizar fatura e cartão (apenas primeira parcela)
-          const fatura = await Fatura.findByPk(fatura_id, {
-            include: ['cartao'],
-          });
-
-          if (fatura) {
-            // Atualizar valor da fatura
-            fatura.valor_total = parseFloat(fatura.valor_total) + parseFloat(valor);
-            await fatura.save();
-
-            // Atualizar limite utilizado do cartão
-            if (fatura.cartao) {
-              fatura.cartao.limite_utilizado = parseFloat(fatura.cartao.limite_utilizado) + parseFloat(valor);
-              await fatura.cartao.save();
-            }
-
-            // Atualizar ou criar movimento de pagamento da fatura
-            if (fatura.movimento_pagamento_id) {
-              const movimentoPagamento = await Movimento.findByPk(fatura.movimento_pagamento_id);
-              if (movimentoPagamento) {
-                movimentoPagamento.valor = fatura.valor_total;
-                await movimentoPagamento.save();
-              }
-            } else {
-              // Se a fatura não tem movimento de pagamento, criar
-              const movimentoPagamento = await Movimento.create({
-                descricao: `Pagamento Fatura ${fatura.cartao.nome} - ${fatura.mes_referencia.toString().padStart(2, '0')}/${fatura.ano_referencia}`,
-                valor: fatura.valor_total,
-                tipo: 'despesa',
-                data_competencia: fatura.data_vencimento,
-                data_pagamento: fatura.data_vencimento,
-                pago: false,
-                recorrente: false,
-                origem: 'fatura',
-                conta_id: fatura.cartao.conta_id,
-                categoria_id: null,
-                fatura_id: fatura_id,
-                user_id: req.userId,
-              });
-
-              fatura.movimento_pagamento_id = movimentoPagamento.id;
-              await fatura.save();
-            }
-
-            // Se não informou data_pagamento, usar data de vencimento da fatura
-            if (!dataPagamentoParcelaStr) {
-              dataPagamentoFinalParcela = fatura.data_vencimento;
-            }
-
-            origemParcela = 'cartao'; // Movimento vinculado a fatura de cartão
-          }
+        if (cartao_id) {
+          faturaIdParcela = await this._encontrarOuCriarFatura(cartao_id, dataCompetenciaParcelaStr, req.userId);
+          origemParcela = 'cartao';
         }
 
-        // Atualizar saldo da conta se o movimento estiver pago (apenas na primeira parcela se for movimento de conta)
-        if (conta_id && pago && i === 0 && !cartao_id && !fatura_id) {
-          const conta = await Conta.findByPk(conta_id);
-          if (conta) {
-            const valorMovimento = parseFloat(valor);
-            if (tipo === 'receita') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) + valorMovimento;
-            } else if (tipo === 'despesa') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) - valorMovimento;
-            }
-            await conta.save();
-          }
-        }
-
-        // Criar descrição baseada no tipo de lançamento
         let descricaoFinal = descricao;
         if (tipoLancamento === 'parcelado') {
           descricaoFinal = `${descricao} - Parcela ${i + 1}/${total_parcelas}`;
         } else if (tipoLancamento === 'recorrente' && i > 0) {
-          // Para recorrentes, manter descrição original mas indicar o mês
-          const dataRef = new Date(dataCompetenciaParcelaStr);
-          const mesAno = `${(dataRef.getMonth() + 1).toString().padStart(2, '0')}/${dataRef.getFullYear()}`;
+          const dataRef = new Date(dataCompetenciaParcelaStr + 'T00:00:00Z');
+          const mesAno = `${(dataRef.getUTCMonth() + 1).toString().padStart(2, '0')}/${dataRef.getUTCFullYear()}`;
           descricaoFinal = `${descricao} (${mesAno})`;
         }
 
-        let dadosMovimento = {
+        const dadosMovimento = {
           descricao: descricaoFinal,
           valor,
           tipo,
           data_competencia: dataCompetenciaParcelaStr,
           data_pagamento: dataPagamentoFinalParcela,
           observacao,
-          pago: i === 0 ? pago : false, // Apenas o primeiro pode ser pago inicialmente
+          pago: i === 0 ? pago : false,
           recorrente: tipoLancamento === 'recorrente',
           parcelado: tipoLancamento === 'parcelado',
-          numero_parcela: tipoLancamento === 'parcelado' ? i + 1 : numero_parcela,
+          numero_parcela: tipoLancamento === 'parcelado' ? i + 1 : null,
           total_parcelas: tipoLancamento === 'parcelado' ? total_parcelas : null,
           origem: origemParcela,
           conta_id,
           categoria_id,
           fatura_id: faturaIdParcela,
           user_id: req.userId,
+          sequencia_id: tipoLancamento === 'recorrente' ? sequencia_id : null,
+          sequencia_numero: tipoLancamento === 'recorrente' ? i + 1 : null,
         };
 
-        if (tipoLancamento === 'recorrente' && sequencia_id) {
-          dadosMovimento.sequencia_id = sequencia_id;
-          dadosMovimento.sequencia_numero = i + 1;
-        }
-
-        // Criar o movimento
         const movimento = await Movimento.create(dadosMovimento);
-
-        // Recarregar com associações
-        const movimentoCompleto = await Movimento.findByPk(movimento.id, {
-          include: ['conta', 'categoria', 'fatura'],
-        });
-
+        const movimentoCompleto = await Movimento.findByPk(movimento.id, { include: ['conta', 'categoria', 'fatura'] });
         movimentosCriados.push(movimentoCompleto);
       }
 
-      // Retornar todos os movimentos criados ou apenas o primeiro se for único
+      // Recalcular saldos após todas as criações
+      if (conta_id) {
+        await this._recalcularSaldoConta(conta_id, req.userId);
+      }
+      if (cartao_id) {
+        const faturasAfetadas = [...new Set(movimentosCriados.map(m => m.fatura_id).filter(id => id))];
+        for (const faturaId of faturasAfetadas) {
+          await this._recalcularValoresFatura(faturaId, req.userId);
+        }
+        await this._recalcularLimiteCartao(cartao_id, req.userId);
+      }
+
       if (movimentosCriados.length === 1) {
         return res.status(201).json(movimentosCriados[0]);
       } else {
-        const mensagem = tipoLancamento === 'parcelado' 
-          ? `${movimentosCriados.length} parcelas criadas com sucesso`
-          : `${movimentosCriados.length} lançamentos recorrentes criados com sucesso`;
-        
-        return res.status(201).json({
-          message: mensagem,
-          tipo: tipoLancamento,
-          total: movimentosCriados.length,
-          movimentos: movimentosCriados,
-        });
-      }
-    } catch (error) {
-      console.error('Erro ao criar movimento:', error);
-      
-      if (error.name === 'SequelizeValidationError') {
-        return res.status(400).json({
-          error: 'Dados inválidos',
-          details: error.errors.map(e => e.message),
-        });
+        return res.status(201).json({ message: `${movimentosCriados.length} lançamentos criados.`, movimentos: movimentosCriados });
       }
 
+    } catch (error) {
+      console.error('Erro ao criar movimento:', error);
+      if (error.name === 'SequelizeValidationError') {
+        return res.status(400).json({ error: 'Dados inválidos', details: error.errors.map(e => e.message) });
+      }
       return res.status(500).json({ error: 'Erro ao criar movimento' });
     }
   }
@@ -687,131 +536,54 @@ class MovimentoController {
   update = async (req, res) => {
     try {
       const { id } = req.params;
-      const {
-        descricao,
-        valor,
-        tipo,
-        data_competencia,
-        data_pagamento,
-        observacao,
-        pago,
-        recorrente,
-        parcelado,
-        numero_parcela,
-        total_parcelas,
-        conta_id,
-        categoria_id,
-        fatura_id,
-        cartao_id,
-        impactar = 'atual', // 'atual', 'todos', 'futuros'
-      } = req.body;
+      const { impactar = 'atual', ...dadosUpdate } = req.body;
 
-      const movimento = await Movimento.findOne({
-        where: { id, user_id: req.userId },
-        include: ['fatura'],
-      });
+      const movimentoInicial = await Movimento.findOne({ where: { id, user_id: req.userId }, include: [{ model: Fatura, as: 'fatura', include: ['cartao'] }] });
+      if (!movimentoInicial) return res.status(404).json({ error: 'Movimento não encontrado' });
+      if (movimentoInicial.origem === 'fatura') return res.status(400).json({ error: 'Pagamentos de fatura não podem ser editados aqui.' });
 
-      if (!movimento) {
-        return res.status(404).json({ error: 'Movimento não encontrado' });
-      }
+      const contaIdOriginal = movimentoInicial.conta_id;
+      const cartaoIdOriginal = movimentoInicial.fatura ? movimentoInicial.fatura.cartao_id : null;
+      const faturaIdOriginal = movimentoInicial.fatura_id;
 
-      // ⚠️ VALIDAÇÃO PRIORITÁRIA: Movimentos de origem 'fatura' não podem ser editados aqui
-      if (movimento.origem === 'fatura') {
-        return res.status(400).json({ 
-          error: 'Movimentos de pagamento de fatura não podem ser editados diretamente',
-          message: 'Solicite na rota de fatura para atualizar este movimento'
-        });
-      }
-
-      // Função para atualizar um movimento
-      const atualizarMovimento = async (mov) => {
-        // ...lógica de reversão e atualização igual ao movimento principal...
-        // Para simplificar, só atualiza os campos informados
-        await mov.update({
-          descricao,
-          valor,
-          tipo,
-          data_competencia,
-          data_pagamento,
-          observacao,
-          pago,
-          recorrente,
-          parcelado,
-          numero_parcela,
-          total_parcelas,
-          conta_id,
-          categoria_id,
-          fatura_id,
-        });
-      };
-
-      // Se o movimento faz parte de uma sequência
-      if (movimento.sequencia_id) {
-        let movimentosParaAtualizar = [];
-        switch (impactar) {
-          case 'todos':
-            movimentosParaAtualizar = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-              },
-            });
-            break;
-          case 'futuros':
-            movimentosParaAtualizar = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-                sequencia_numero: { [Op.gte]: movimento.sequencia_numero }, // Inclui o atual e os futuros
-              },
-            });
-            break;
-          case 'anteriores':
-            movimentosParaAtualizar = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-                sequencia_numero: { [Op.lte]: movimento.sequencia_numero },
-              },
-            });
-            break;
-          case 'atual':
-          default:
-            movimentosParaAtualizar = [movimento];
-        }
-
-        for (const mov of movimentosParaAtualizar) {
-          await atualizarMovimento(mov);
-        }
-
-        // Recarregar todos os movimentos atualizados
-        const ids = movimentosParaAtualizar.map(m => m.id);
-        const movimentosAtualizados = await Movimento.findAll({
-          where: { id: ids },
-          include: ['conta', 'categoria', 'fatura'],
-        });
-        return res.json({
-          message: `Movimentos atualizados (${impactar})`,
-          movimentos: movimentosAtualizados,
-        });
+      const movimentosParaAtualizar = [];
+      if (movimentoInicial.sequencia_id && impactar !== 'atual') {
+        const whereSequencia = { sequencia_id: movimentoInicial.sequencia_id, user_id: req.userId };
+        if (impactar === 'futuros') whereSequencia.sequencia_numero = { [Op.gte]: movimentoInicial.sequencia_numero };
+        if (impactar === 'anteriores') whereSequencia.sequencia_numero = { [Op.lte]: movimentoInicial.sequencia_numero };
+        const result = await Movimento.findAll({ where: whereSequencia });
+        movimentosParaAtualizar.push(...result);
       } else {
-        // Não faz parte de sequência, atualizar só o atual
-        await atualizarMovimento(movimento);
-        const movimentoAtualizado = await Movimento.findByPk(id, {
-          include: ['conta', 'categoria', 'fatura'],
-        });
-        return res.json(movimentoAtualizado);
+        movimentosParaAtualizar.push(movimentoInicial);
       }
+
+      for (const mov of movimentosParaAtualizar) {
+        await mov.update(dadosUpdate);
+      }
+
+      // Recalcular saldos
+      const contasAfetadas = new Set([contaIdOriginal, dadosUpdate.conta_id].filter(id => id));
+      const cartoesAfetados = new Set([cartaoIdOriginal, dadosUpdate.cartao_id].filter(id => id));
+      const faturasAfetadas = new Set([faturaIdOriginal, dadosUpdate.fatura_id].filter(id => id));
+
+      for (const contaId of contasAfetadas) {
+        await this._recalcularSaldoConta(contaId, req.userId);
+      }
+      for (const faturaId of faturasAfetadas) {
+        const cartaoId = await this._recalcularValoresFatura(faturaId, req.userId);
+        if (cartaoId) cartoesAfetados.add(cartaoId);
+      }
+      for (const cartaoId of cartoesAfetados) {
+        await this._recalcularLimiteCartao(cartaoId, req.userId);
+      }
+
+      const ids = movimentosParaAtualizar.map(m => m.id);
+      const movimentosAtualizados = await Movimento.findAll({ where: { id: { [Op.in]: ids } }, include: ['conta', 'categoria', 'fatura'] });
+
+      return res.json({ message: `Movimentos atualizados (${impactar})`, movimentos: movimentosAtualizados });
+
     } catch (error) {
       console.error('Erro ao atualizar movimento:', error);
-      
-      if (error.name === 'SequelizeValidationError') {
-        return res.status(400).json({
-          error: 'Dados inválidos',
-          details: error.errors.map(e => e.message),
-        });
-      }
-
       return res.status(500).json({ error: 'Erro ao atualizar movimento' });
     }
   }
@@ -822,114 +594,40 @@ class MovimentoController {
       const { id } = req.params;
       const { impactar = 'atual' } = req.body;
 
-      const movimento = await Movimento.findOne({
-        where: { id, user_id: req.userId },
-        include: ['fatura'],
-      });
+      const movimentoInicial = await Movimento.findOne({ where: { id, user_id: req.userId }, include: [{ model: Fatura, as: 'fatura', include: ['cartao'] }] });
+      if (!movimentoInicial) return res.status(404).json({ error: 'Movimento não encontrado' });
 
-      if (!movimento) {
-        return res.status(404).json({ error: 'Movimento não encontrado' });
-      }
+      const contaIdAfetada = movimentoInicial.conta_id;
+      const cartaoIdAfetado = movimentoInicial.fatura ? movimentoInicial.fatura.cartao_id : null;
+      const faturaIdAfetada = movimentoInicial.fatura_id;
 
-      // Função para reverter e excluir um movimento
-      const excluirMovimento = async (mov) => {
-        // ...lógica de reversão igual ao movimento principal...
-        // Se é um movimento de pagamento de fatura (origem: 'fatura')
-        if (mov.origem === 'fatura') {
-          const faturaPagamento = await Fatura.findOne({
-            where: { movimento_pagamento_id: mov.id },
-            include: ['cartao'],
-          });
-          if (faturaPagamento) {
-            const valorMovimento = parseFloat(mov.valor);
-            faturaPagamento.valor_pago = parseFloat(faturaPagamento.valor_pago) - valorMovimento;
-            const valorTotalFatura = parseFloat(faturaPagamento.valor_total);
-            const novoValorPago = parseFloat(faturaPagamento.valor_pago);
-            if (novoValorPago < valorTotalFatura) {
-              faturaPagamento.status = 'fechada';
-            }
-            faturaPagamento.movimento_pagamento_id = null;
-            await faturaPagamento.save();
-            if (faturaPagamento.cartao && mov.pago) {
-              faturaPagamento.cartao.limite_utilizado = parseFloat(faturaPagamento.cartao.limite_utilizado) + valorMovimento;
-              await faturaPagamento.cartao.save();
-            }
-          }
-        }
-        // Reverter o saldo se o movimento estava pago
-        if (mov.pago && mov.conta_id) {
-          const conta = await Conta.findByPk(mov.conta_id);
-          if (conta) {
-            const valorMovimento = parseFloat(mov.valor);
-            if (mov.tipo === 'receita') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) - valorMovimento;
-            } else if (mov.tipo === 'despesa') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) + valorMovimento;
-            }
-            await conta.save();
-          }
-        }
-        // Reverter valores do cartão e fatura se for movimento de cartão
-        if (mov.fatura_id) {
-          const fatura = await Fatura.findByPk(mov.fatura_id, {
-            include: ['cartao'],
-          });
-          if (fatura) {
-            const valorMovimento = parseFloat(mov.valor);
-            fatura.valor_total = Math.max(0, parseFloat(fatura.valor_total) - valorMovimento);
-            await fatura.save();
-            if (fatura.cartao) {
-              const novoLimiteUtilizado = parseFloat(fatura.cartao.limite_utilizado) - valorMovimento;
-              fatura.cartao.limite_utilizado = Math.max(0, novoLimiteUtilizado);
-              await fatura.cartao.save();
-            }
-          }
-        }
-        await mov.destroy();
-      };
-
-      if (movimento.sequencia_id) {
-        let movimentosParaExcluir = [];
-        switch (impactar) {
-          case 'todos':
-            movimentosParaExcluir = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-              },
-            });
-            break;
-          case 'futuros':
-            movimentosParaExcluir = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-                sequencia_numero: { [Op.gte]: movimento.sequencia_numero },
-              },
-            });
-            break;
-          case 'anteriores':
-            movimentosParaExcluir = await Movimento.findAll({
-              where: {
-                sequencia_id: movimento.sequencia_id,
-                user_id: req.userId,
-                sequencia_numero: { [Op.lte]: movimento.sequencia_numero },
-              },
-            });
-            break;
-          case 'atual':
-          default:
-            movimentosParaExcluir = [movimento];
-        }
-
-        for (const mov of movimentosParaExcluir) {
-          await excluirMovimento(mov);
-        }
-        return res.status(204).send();
+      const movimentosParaExcluir = [];
+      if (movimentoInicial.sequencia_id && impactar !== 'atual') {
+        const whereSequencia = { sequencia_id: movimentoInicial.sequencia_id, user_id: req.userId };
+        if (impactar === 'futuros') whereSequencia.sequencia_numero = { [Op.gte]: movimentoInicial.sequencia_numero };
+        if (impactar === 'anteriores') whereSequencia.sequencia_numero = { [Op.lte]: movimentoInicial.sequencia_numero };
+        const result = await Movimento.findAll({ where: whereSequencia });
+        movimentosParaExcluir.push(...result);
       } else {
-        await excluirMovimento(movimento);
-        return res.status(204).send();
+        movimentosParaExcluir.push(movimentoInicial);
       }
+
+      for (const mov of movimentosParaExcluir) {
+        await mov.destroy();
+      }
+
+      // Recalcular saldos
+      if (contaIdAfetada) {
+        await this._recalcularSaldoConta(contaIdAfetada, req.userId);
+      }
+      if (faturaIdAfetada) {
+        await this._recalcularValoresFatura(faturaIdAfetada, req.userId);
+      }
+      if (cartaoIdAfetado) {
+        await this._recalcularLimiteCartao(cartaoIdAfetado, req.userId);
+      }
+
+      return res.status(204).send();
     } catch (error) {
       console.error('Erro ao deletar movimento:', error);
       return res.status(500).json({ error: 'Erro ao deletar movimento' });
@@ -941,44 +639,30 @@ class MovimentoController {
     try {
       const { id } = req.params;
 
-      const movimento = await Movimento.findOne({
-        where: { id, user_id: req.userId },
-      });
+      const movimento = await Movimento.findOne({ where: { id, user_id: req.userId } });
+      if (!movimento) return res.status(404).json({ error: 'Movimento não encontrado' });
 
-      if (!movimento) {
-        return res.status(404).json({ error: 'Movimento não encontrado' });
+      await movimento.update({ pago: !movimento.pago });
+
+      // Recalcular saldo da conta, se houver
+      if (movimento.conta_id) {
+        await this._recalcularSaldoConta(movimento.conta_id, req.userId);
       }
 
-      const novoPago = !movimento.pago;
+      // Se for um pagamento de fatura, o status da fatura e limite do cartão podem mudar
+      if (movimento.origem === 'fatura' && movimento.fatura_id) {
+        const fatura = await Fatura.findByPk(movimento.fatura_id);
+        if (fatura) {
+          fatura.valor_pago = movimento.pago ? movimento.valor : 0;
+          fatura.status = movimento.pago ? 'paga' : 'fechada';
+          await fatura.save();
 
-      // Atualizar saldo da conta
-      if (movimento.conta_id) {
-        const conta = await Conta.findByPk(movimento.conta_id);
-        if (conta) {
-          const valorMovimento = parseFloat(movimento.valor);
-          
-          if (novoPago) {
-            // Marcar como pago
-            if (movimento.tipo === 'receita') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) + valorMovimento;
-            } else if (movimento.tipo === 'despesa') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) - valorMovimento;
-            }
-          } else {
-            // Marcar como não pago
-            if (movimento.tipo === 'receita') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) - valorMovimento;
-            } else if (movimento.tipo === 'despesa') {
-              conta.saldo_atual = parseFloat(conta.saldo_atual) + valorMovimento;
-            }
-          }
-          
-          await conta.save();
+          // O limite do cartão só é liberado quando a fatura é paga
+          await this._recalcularLimiteCartao(fatura.cartao_id, req.userId);
         }
       }
 
-      await movimento.update({ pago: novoPago });
-
+      await movimento.reload();
       return res.json(movimento);
     } catch (error) {
       console.error('Erro ao atualizar status de pagamento:', error);
